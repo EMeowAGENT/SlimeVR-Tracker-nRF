@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <math.h>
 #include <string.h>
+#include <zephyr/sys/atomic.h>
 
 LOG_MODULE_REGISTER(tcal_heated, LOG_LEVEL_INF);
 
@@ -74,6 +75,8 @@ static struct {
 } heat;
 static struct TempCalPoint stage[TCAL_BUFFER_SIZE];
 static uint32_t owner_epoch;
+/* Lock-free publication for the sensor thread's rest gate. */
+static atomic_t heated_active;
 
 static enum tcal_heated_stop_reason check_locked(struct sensor_temperature_observation *observation);
 
@@ -94,6 +97,11 @@ bool sensor_tcal_heated_busy(void)
 	bool busy = sensor_tcal_heated_busy_locked();
 	sensor_tcal_heated_unlock();
 	return busy;
+}
+
+bool sensor_tcal_heated_active(void)
+{
+	return atomic_get(&heated_active) != 0;
 }
 
 static bool heat_safety_reason(enum tcal_heated_stop_reason reason)
@@ -150,6 +158,7 @@ static void heat_safety_refresh_locked(void)
 /* Gate held; hardware off precedes any release/publication/storage operation. */
 static int finish_locked(enum tcal_heated_stop_reason reason)
 {
+	atomic_set(&heated_active, 0);
 	int err = heater_hw_force_off();
 	if (err) {
 		LOG_ERR("Heater off failed: %d; hardware unavailable", err);
@@ -406,6 +415,7 @@ int sensor_tcal_heated_start(float target_temp)
 		err = sensor_calibration_heated_reserve_locked();
 	}
 	if (!err) {
+		atomic_set(&heated_active, 1);
 		tcal_accum_request_reset();
 		heat_feedback_finish_locked(LED_CANCELLED);
 		heat.protection_id = 0;

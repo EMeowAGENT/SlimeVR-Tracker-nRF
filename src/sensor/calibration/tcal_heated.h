@@ -25,6 +25,8 @@ int sensor_tcal_heated_abort(enum tcal_heated_stop_reason reason);
 void sensor_tcal_heated_set_ready(bool ready);
 void sensor_tcal_heated_update(bool is_resting);
 bool sensor_tcal_heated_busy(void);
+/* Lock-free: true while a heated session owns the calibration slot. */
+bool sensor_tcal_heated_active(void);
 void sensor_tcal_heated_report(void);
 
 /* Sensor owner only. True suppresses the ordinary auto accumulator. */

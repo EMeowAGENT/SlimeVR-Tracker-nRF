@@ -3048,8 +3048,17 @@ static void sensor_loop_publish(sensor_loop_frame_t *frame)
 	 * Empty or unknown evidence never grants sleeping/calibration eligibility. */
 	resting = resting && observed && sensor_motion_frame_current(frame->sensor_epoch);
 #if CONFIG_SENSOR_TCAL_HEATED
-	heated_resting = resting;
-	sensor_tcal_heated_update(resting);
+	/* The upper motion detector gates on the accelerometer deviation, which
+	 * this unit's IMU drifts with temperature. During a heated T-Cal the gyro
+	 * bias is what is sampled; the fusion rest detector already proves the
+	 * device is stationary, and the T-Cal accumulator keeps its own motion
+	 * gates. Use fusion rest as an additional truth only for this session. */
+	bool tcal_rest = resting;
+	if (sensor_tcal_heated_active() && sensor_fusion_get_rest_detected()) {
+		tcal_rest = true;
+	}
+	heated_resting = tcal_rest;
+	sensor_tcal_heated_update(tcal_rest);
 #endif
 	if (observed && sensor_motion_frame_current(frame->sensor_epoch)) {
 		if (angular_speed_dps >= 0.0f)
