@@ -152,17 +152,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- 基线：原厂配置 ----
+          # ---- 基线：原厂配置（对照组）----
           - variant: p10
             board: sk_cheesecake_nrf_p10/nrf52840/uf2
             artifact: SlimeNRF_CheeseCake_P10
             conf: ""
-          - variant: p00
-            board: sk_cheesecake_nrf_p00/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P00
-            conf: ""
 
-          # ---- Kconfig 变体（只针对 P10）----
+          # ---- 稳定性 / 诊断 ----
+          - variant: nowom
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_nowom
+            conf: nowom.conf
+          - variant: noheater
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_noheater
+            conf: noheater.conf
+
+          # ---- 精度 / 功耗 ----
           - variant: bootcal
             board: sk_cheesecake_nrf_p10/nrf52840/uf2
             artifact: SlimeNRF_CheeseCake_P10_bootcal
@@ -175,10 +181,6 @@ jobs:
             board: sk_cheesecake_nrf_p10/nrf52840/uf2
             artifact: SlimeNRF_CheeseCake_P10_lowpower
             conf: lowpower.conf
-          - variant: debug
-            board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10_debug
-            conf: debug.conf
     steps:
       - name: 💻 Checkout Repository
         uses: actions/checkout@v6
