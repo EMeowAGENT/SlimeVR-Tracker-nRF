@@ -177,6 +177,10 @@ jobs:
             board: sk_cheesecake_nrf_p10/nrf52840/uf2
             artifact: SlimeNRF_CheeseCake_P10_eqf
             conf: eqf.conf
+          - variant: vqf-fixed
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_vqffixed
+            conf: vqf-fixed.conf
           - variant: lowpower
             board: sk_cheesecake_nrf_p10/nrf52840/uf2
             artifact: SlimeNRF_CheeseCake_P10_lowpower
