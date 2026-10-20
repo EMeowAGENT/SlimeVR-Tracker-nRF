@@ -12,6 +12,7 @@
 #include "system/system.h"
 #include "system/esb_ota.h"
 #include "connection/connection.h"
+#include "connection/tracker_events.h"
 #include "util.h"
 #include <errno.h>
 #include <math.h>
@@ -57,6 +58,8 @@ static struct {
 	bool rise_limited;
 	uint16_t duty;
 	uint16_t count;
+	/* Remote telemetry token; 0 when no listener holds a subscription. */
+	uint16_t op;
 	float accepted_min;
 	float accepted_max;
 	int64_t started_ms;
@@ -100,6 +103,76 @@ static bool heat_safety_reason(enum tcal_heated_stop_reason reason)
 {
 	return reason == TCAL_HEATED_STOP_STALE_TEMP || reason == TCAL_HEATED_STOP_OVERTEMP ||
 		reason == TCAL_HEATED_STOP_RISE_FAST || reason == TCAL_HEATED_STOP_HEATER_ERROR;
+}
+
+/* Remote diagnosis: heated sessions otherwise emit only LED semantics, so a
+ * failure could not be told apart from a rejection without local console. */
+static uint8_t heat_cal_reason(enum tcal_heated_stop_reason reason)
+{
+	switch (reason) {
+	case TCAL_HEATED_STOP_SENSOR_STOP:
+	case TCAL_HEATED_STOP_HEATER_ERROR:
+		return CAL_REASON_SENSOR_UNAVAILABLE;
+	case TCAL_HEATED_STOP_POWER_DOWN:
+		return CAL_REASON_POWER_DOWN;
+	case TCAL_HEATED_STOP_USER:
+		return CAL_REASON_RESET;
+	case TCAL_HEATED_STOP_TIMEOUT:
+		return CAL_REASON_RECORD_TIMEOUT;
+	case TCAL_HEATED_STOP_STALE_TEMP:
+	case TCAL_HEATED_STOP_OVERTEMP:
+		return CAL_REASON_TEMPERATURE;
+	case TCAL_HEATED_STOP_RISE_FAST:
+		return CAL_REASON_QUALITY;
+	case TCAL_HEATED_STOP_INSUFFICIENT_COVERAGE:
+		return CAL_REASON_NO_TCAL_COVERAGE;
+	default:
+		return CAL_REASON_NONE;
+	}
+}
+
+static uint8_t heat_start_cal_reason(int err)
+{
+	switch (err) {
+	case -EBUSY:
+		return CAL_REASON_BUSY;
+	case -EAGAIN:
+	case -ENODATA:
+		return CAL_REASON_SENSOR_UNAVAILABLE;
+	case -ESHUTDOWN:
+	case -ENODEV:
+		return CAL_REASON_POWER_DOWN;
+	case -EINVAL:
+	case -ERANGE:
+		return CAL_REASON_INVALID_ARGUMENT;
+	case -ENOTSUP:
+		return CAL_REASON_UNSUPPORTED;
+	default:
+		return CAL_REASON_SENSOR_UNAVAILABLE;
+	}
+}
+
+static uint8_t heat_cal_outcome(enum tcal_heated_stop_reason reason)
+{
+	if (reason == TCAL_HEATED_STOP_COMPLETE) {
+		return CAL_OUTCOME_SUCCESS;
+	}
+	if (reason == TCAL_HEATED_STOP_USER || reason == TCAL_HEATED_STOP_POWER_DOWN ||
+	    reason == TCAL_HEATED_STOP_SENSOR_STOP) {
+		return CAL_OUTCOME_CANCELLED;
+	}
+	return CAL_OUTCOME_FAILED;
+}
+
+static uint8_t heat_cal_phase(enum tcal_heated_stop_reason reason)
+{
+	if (reason == TCAL_HEATED_STOP_COMPLETE) {
+		return CAL_PHASE_APPLIED;
+	}
+	if (reason == TCAL_HEATED_STOP_INSUFFICIENT_COVERAGE) {
+		return CAL_PHASE_VALIDATE;
+	}
+	return CAL_PHASE_COLLECT;
 }
 
 static void heat_feedback_finish_locked(enum led_semantic semantic)
@@ -178,6 +251,11 @@ static int finish_locked(enum tcal_heated_stop_reason reason)
 		}
 		heat_feedback_finish_locked(reason == TCAL_HEATED_STOP_USER || reason == TCAL_HEATED_STOP_SENSOR_STOP ||
 			reason == TCAL_HEATED_STOP_POWER_DOWN ? LED_CANCELLED : LED_FAILED);
+		if (heat.op) {
+			cal_event_end(heat.op, heat_cal_outcome(reason), heat_cal_phase(reason),
+				      heat_cal_reason(reason));
+			heat.op = 0;
+		}
 	}
 	return err;
 }
@@ -193,6 +271,7 @@ int sensor_tcal_heated_abort(enum tcal_heated_stop_reason reason)
 	}
 	int err = finish_locked(reason);
 	sensor_tcal_heated_unlock();
+	tracker_events_notify();
 	return err;
 }
 
@@ -205,6 +284,7 @@ int sensor_tcal_heated_stop(void)
 		if (reason != TCAL_HEATED_STOP_NONE) {
 			int err = finish_locked(reason);
 			sensor_tcal_heated_unlock();
+			tracker_events_notify();
 			return err;
 		}
 	}
@@ -230,6 +310,7 @@ int sensor_tcal_heated_stop(void)
 		led_request_event(LED_OWNER_TCAL, led_request_id(), led_event_id(), LED_CANCELLED);
 	}
 	sensor_tcal_heated_unlock();
+	tracker_events_notify();
 	return err;
 }
 
@@ -410,6 +491,7 @@ int sensor_tcal_heated_start(float target_temp)
 		heat_feedback_finish_locked(LED_CANCELLED);
 		heat.protection_id = 0;
 		heat.written_mask = 0;
+		heat.op = 0;
 		led_operation_publish(LED_OWNER_TCAL, false, true);
 		heat.epoch++;
 		/* Generation zero is not a valid hardware session lease. */
@@ -457,9 +539,18 @@ int sensor_tcal_heated_start(float target_temp)
 			sensor_calibration_result(heat.feedback, LED_ACCEPTED);
 			sensor_calibration_stage(heat.feedback, LED_PROCESSING);
 			led_fault_publish(LED_OWNER_TCAL, LED_FAULT_NONE, 0);
+			/* Remote trace: ACCEPTED/BEGIN, then progress and terminal reason. */
+			heat.op = cal_event_accept(CAL_KIND_TCAL_RUNTIME);
+			if (heat.op) {
+				cal_event_start(heat.op, CAL_PHASE_COLLECT, 0);
+			}
 		}
 	}
 	sensor_tcal_heated_unlock();
+	if (err) {
+		cal_event_reject(CAL_KIND_TCAL_RUNTIME, heat_start_cal_reason(err));
+	}
+	tracker_events_notify();
 	return err ? sensor_operation_result(LED_OWNER_TCAL, err, false) : 0;
 }
 
@@ -527,6 +618,7 @@ void sensor_tcal_heated_update(bool is_resting)
 	sync_owner_locked();
 	if (heat.state != HEAT_RUNNING && heat.state != HEAT_FINALIZING) {
 		sensor_tcal_heated_unlock();
+		tracker_events_notify();
 		return;
 	}
 	struct sensor_temperature_observation observation;
@@ -535,12 +627,14 @@ void sensor_tcal_heated_update(bool is_resting)
 	if (reason != TCAL_HEATED_STOP_NONE) {
 		(void)finish_locked(reason);
 		sensor_tcal_heated_unlock();
+		tracker_events_notify();
 		return;
 	}
 	if (heat.state == HEAT_FINALIZING) {
 		/* Keep raw safety evidence current without touching the frozen stage,
 		 * ramp or deliberately disarmed hardware while storage is pending. */
 		sensor_tcal_heated_unlock();
+		tracker_events_notify();
 		return;
 	}
 	if (!is_resting || heat.rise_limited) {
@@ -570,6 +664,7 @@ void sensor_tcal_heated_update(bool is_resting)
 	if (reason != TCAL_HEATED_STOP_NONE) {
 		(void)finish_locked(reason);
 		sensor_tcal_heated_unlock();
+		tracker_events_notify();
 		return;
 	}
 	bool control_due = elapsed >= HEAT_CONTROL_MS;
@@ -616,15 +711,24 @@ void sensor_tcal_heated_update(bool is_resting)
 		if (!v_finite(&desired, 1)) {
 			(void)finish_locked(TCAL_HEATED_STOP_HEATER_ERROR);
 			sensor_tcal_heated_unlock();
+			tracker_events_notify();
 			return;
 		}
 		heat.duty = (uint16_t)desired;
 		if (control_due) {
 			heat.control_ms = now;
+			/* Coalesced progress: phase distinguishes active sampling from a
+			 * motion/rise pause; detail carries filtered temperature in C. */
+			if (heat.op) {
+				cal_event_step(heat.op,
+					       heat.sampling ? CAL_PHASE_COLLECT : CAL_PHASE_WAIT_STILL,
+					       (uint8_t)CLAMP(observation.filtered_c + 0.5f, 0.0f, 255.0f));
+			}
 		}
 		if (heater_hw_write(heat.epoch, observation.sequence, observation.sampled_at_ms, observation.raw_c, heat.duty)) {
 			(void)finish_locked(TCAL_HEATED_STOP_HEATER_ERROR);
 			sensor_tcal_heated_unlock();
+			tracker_events_notify();
 			return;
 		}
 	}
@@ -650,6 +754,7 @@ void sensor_tcal_heated_update(bool is_resting)
 		heat.stable_since = -1;
 	}
 	sensor_tcal_heated_unlock();
+	tracker_events_notify();
 }
 
 static bool qualified_locked(void)
@@ -749,6 +854,12 @@ void sensor_tcal_heated_finalize(void)
 			heat.state = HEAT_FINISHED;
 			heat.epoch++;
 			sensor_calibration_heated_release_locked();
+			/* Successful completion is linearized here, not in finish_locked. */
+			if (heat.op) {
+				cal_event_end(heat.op, CAL_OUTCOME_SUCCESS, CAL_PHASE_APPLIED,
+					      CAL_REASON_NONE);
+				heat.op = 0;
+			}
 		}
 	}
 	sensor_tcal_heated_unlock();
