@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - dev
+      - ci/tcal-fast
     paths:
       - ".github/workflows/cheesecake-variants.yml"
       - ".github/ci/cheesecake/**"
@@ -152,43 +152,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- 基线：原厂配置（对照组）----
-          - variant: p10
+          # ---- 实验分支：只构建加热校准首点变体 ----
+          - variant: p10-tcalfast
             board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10
-            conf: ""
-          - variant: p00
+            artifact: SlimeNRF_CheeseCake_P10_tcalfast
+            conf: tcal-fast.conf
+          - variant: p00-tcalfast
             board: sk_cheesecake_nrf_p00/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P00
-            conf: ""
-
-          # ---- 稳定性 / 诊断 ----
-          - variant: nowom
-            board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10_nowom
-            conf: nowom.conf
-          - variant: noheater
-            board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10_noheater
-            conf: noheater.conf
-
-          # ---- 精度 / 功耗 ----
-          - variant: bootcal
-            board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10_bootcal
-            conf: bootcal.conf
-          - variant: eqf
-            board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10_eqf
-            conf: eqf.conf
-          - variant: vqf-fixed
-            board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10_vqffixed
-            conf: vqf-fixed.conf
-          - variant: lowpower
-            board: sk_cheesecake_nrf_p10/nrf52840/uf2
-            artifact: SlimeNRF_CheeseCake_P10_lowpower
-            conf: lowpower.conf
+            artifact: SlimeNRF_CheeseCake_P00_tcalfast
+            conf: tcal-fast.conf
     steps:
       - name: 💻 Checkout Repository
         uses: actions/checkout@v6
