@@ -43,6 +43,9 @@ bool sensor_tcal_heated_busy_locked(void);
 void sensor_tcal_heated_accept_point(int idx, const float bias[3], float temp);
 /* Sensor owner, gate held; accepted slots are immutable within a session. */
 bool sensor_tcal_heated_slot_accepted(int idx);
+/* Lock-free: the first accepted point has not landed yet, so the runtime may
+ * use the shorter first-window flush interval. */
+bool sensor_tcal_heated_first_point_pending(void);
 bool sensor_tcal_heated_start_window(float temp);
 int sensor_calibration_heated_reserve_locked(void);
 void sensor_calibration_heated_release_locked(void);

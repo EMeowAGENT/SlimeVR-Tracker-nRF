@@ -17,11 +17,18 @@
 #include <errno.h>
 #include <math.h>
 #include <string.h>
+#include <zephyr/sys/atomic.h>
 
 LOG_MODULE_REGISTER(tcal_heated, LOG_LEVEL_INF);
 
 #define HEAT_FRESH_MS 2000
 #define HEAT_CONTROL_MS 1000
+/* Brief desk vibration must not wipe the accumulator: only sustained motion
+ * resets it, so a 3 s still window can still contribute samples. */
+#define HEAT_MOTION_GRACE_MS 2000
+/* Without any accepted start-band point the session can never ramp. Fail
+ * loudly instead of silently burning the 90 min session budget. */
+#define HEAT_FIRST_POINT_TIMEOUT_MS 180000
 
 enum heat_state { HEAT_IDLE, HEAT_RESERVED, HEAT_RUNNING, HEAT_FINALIZING, HEAT_FINISHED, HEAT_OFF_FAILED };
 
@@ -60,6 +67,10 @@ static struct {
 	uint16_t count;
 	/* Remote telemetry token; 0 when no listener holds a subscription. */
 	uint16_t op;
+	/* One-shot start-band re-anchor: the first point may arrive after the IMU
+	 * has thermally settled away from the temperature observed at start. */
+	bool reanchored;
+	int64_t nonrest_since;
 	float accepted_min;
 	float accepted_max;
 	int64_t started_ms;
@@ -76,6 +87,8 @@ static struct {
 	enum tcal_heated_stop_reason protection_reason;
 } heat;
 static struct TempCalPoint stage[TCAL_BUFFER_SIZE];
+/* Read by the accumulator (heat lock already held there), so it must not lock. */
+static atomic_t heat_first_point_pending = ATOMIC_INIT(0);
 static uint32_t owner_epoch;
 
 static enum tcal_heated_stop_reason check_locked(struct sensor_temperature_observation *observation);
@@ -492,6 +505,9 @@ int sensor_tcal_heated_start(float target_temp)
 		heat.protection_id = 0;
 		heat.written_mask = 0;
 		heat.op = 0;
+		heat.reanchored = false;
+		heat.nonrest_since = -1;
+		atomic_set(&heat_first_point_pending, 1);
 		led_operation_publish(LED_OWNER_TCAL, false, true);
 		heat.epoch++;
 		/* Generation zero is not a valid hardware session lease. */
@@ -581,11 +597,17 @@ void sensor_tcal_heated_accept_point(int idx, const float bias[3], float temp)
 		return;
 	}
 	heat.count++;
+	atomic_set(&heat_first_point_pending, 0);
 	stage[idx].temp = temp;
 	memcpy(stage[idx].bias, bias, sizeof(stage[idx].bias));
 	heat.accepted_min = fminf(heat.accepted_min, temp);
 	heat.accepted_max = fmaxf(heat.accepted_max, temp);
 	heat.start_band_covered |= fabsf(temp - heat.start_temp) <= 1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE;
+}
+
+bool sensor_tcal_heated_first_point_pending(void)
+{
+	return atomic_get(&heat_first_point_pending) != 0;
 }
 
 bool sensor_tcal_heated_slot_accepted(int idx)
@@ -638,11 +660,19 @@ void sensor_tcal_heated_update(bool is_resting)
 		return;
 	}
 	if (!is_resting || heat.rise_limited) {
+		if (heat.nonrest_since < 0) {
+			heat.nonrest_since = now;
+		}
 		heat.rest_since = -1;
 		heat.stable_since = -1;
 		heat.sampling = false;
-		tcal_accum_reset();
+		/* Keep a partially filled window across brief vibration; only
+		 * sustained motion (or a thermal-rate limit) discards it. */
+		if (heat.rise_limited || now - heat.nonrest_since >= HEAT_MOTION_GRACE_MS) {
+			tcal_accum_reset();
+		}
 	} else {
+		heat.nonrest_since = -1;
 		if (heat.rest_since < 0) {
 			heat.rest_since = now;
 		}
@@ -663,6 +693,24 @@ void sensor_tcal_heated_update(bool is_resting)
 	}
 	if (reason != TCAL_HEATED_STOP_NONE) {
 		(void)finish_locked(reason);
+		sensor_tcal_heated_unlock();
+		tracker_events_notify();
+		return;
+	}
+	/* The start band is a single point, not a target: re-anchor it once if the
+	 * IMU settled outside it before any point was accepted. */
+	if (!heat.reanchored && heat.count == 0 && v_finite(&observation.filtered_c, 1) &&
+	    fabsf(observation.filtered_c - heat.start_temp) >
+		    1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE) {
+		heat.start_temp = observation.filtered_c;
+		heat.setpoint = observation.filtered_c;
+		heat.ramp_elapsed_ms = 0;
+		heat.reanchored = true;
+		tcal_accum_reset();
+		LOG_WRN("Heated T-Cal: start band re-anchored at %.2f C", (double)heat.start_temp);
+	}
+	if (heat.count == 0 && now - heat.started_ms >= HEAT_FIRST_POINT_TIMEOUT_MS) {
+		(void)finish_locked(TCAL_HEATED_STOP_INSUFFICIENT_COVERAGE);
 		sensor_tcal_heated_unlock();
 		tracker_events_notify();
 		return;
@@ -720,9 +768,22 @@ void sensor_tcal_heated_update(bool is_resting)
 			/* Coalesced progress: phase distinguishes active sampling from a
 			 * motion/rise pause; detail carries filtered temperature in C. */
 			if (heat.op) {
-				cal_event_step(heat.op,
-					       heat.sampling ? CAL_PHASE_COLLECT : CAL_PHASE_WAIT_STILL,
-					       (uint8_t)CLAMP(observation.filtered_c + 0.5f, 0.0f, 255.0f));
+				/* cal_event_step coalesces per operation, so temperature
+				 * and heater drive alternate instead of overwriting each
+				 * other. PROBATION carries duty in percent: detail==0 with a
+				 * flat temperature proves the heater was never asked to
+				 * work, which is different from a broken heater. */
+				static uint32_t telemetry_tick;
+				if (telemetry_tick++ & 1U) {
+					cal_event_step(heat.op, CAL_PHASE_PROBATION,
+						       (uint8_t)(heat.duty / 100U));
+				} else {
+					cal_event_step(heat.op,
+						       heat.sampling ? CAL_PHASE_COLLECT
+								     : CAL_PHASE_WAIT_STILL,
+						       (uint8_t)CLAMP(observation.filtered_c + 0.5f,
+								      0.0f, 255.0f));
+				}
 			}
 		}
 		if (heater_hw_write(heat.epoch, observation.sequence, observation.sampled_at_ms, observation.raw_c, heat.duty)) {
