@@ -1,0 +1,309 @@
+# 只构建 CheeseCake（P10 / P00）并同时产出若干 Kconfig 变体固件。
+#
+# 设计要点
+#  - 与上游 workflow.yml 独立，互不影响；缓存键独立，不会互相污染。
+#  - 变体的 Kconfig 片段放在 .github/ci/cheesecake/*.conf，构建前追加到 prj.conf。
+#  - 追加到 prj.conf 是刻意的：它不依赖 sysbuild 对 EXTRA_CONF_FILE 的转发行为，
+#    在任何 Zephyr/NCS 版本上都一定生效。
+name: CheeseCake Variants
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+    paths:
+      - ".github/workflows/cheesecake-variants.yml"
+      - ".github/ci/cheesecake/**"
+
+concurrency:
+  group: cheesecake-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  ZEPHYR_SDK_VERSION: "1.0.1"
+  ZEPHYR_TOOLCHAIN_VARIANT: "zephyr/gnu"
+  REPO_DIR: SlimeVR-Tracker-nRF
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      sdk-hash: ${{ steps.vars.outputs.sdk-hash }}
+      repo-hash: ${{ steps.vars.outputs.repo-hash }}
+      repo-url: ${{ steps.vars.outputs.repo-url }}
+    steps:
+      - name: 💻 Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          path: zephyr-workspace/${{ env.REPO_DIR }}
+          submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: 📟 Generate Variables
+        id: vars
+        env:
+          PR_HEAD_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          WEST_FILE="zephyr-workspace/$REPO_DIR/west.yml"
+          if [ ! -f "$WEST_FILE" ]; then
+            echo "west.yml not found at $WEST_FILE" >&2
+            exit 1
+          fi
+
+          SDK_URL=$(grep -A5 "name: sdk-nrf" "$WEST_FILE" | grep "url:" | sed 's/.*url: *//')
+          SDK_REVISION=$(grep -A5 "name: sdk-nrf" "$WEST_FILE" | grep "revision:" | sed 's/.*revision: *//')
+          SDK_COMMIT=$(git ls-remote "$SDK_URL" "$SDK_REVISION" | awk '{print $1}')
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            REPO_URL="$PR_HEAD_REPO_URL"
+            REPO_HASH="$PR_HEAD_SHA"
+          else
+            REPO_URL="https://github.com/$GITHUB_REPOSITORY.git"
+            REPO_HASH="$GITHUB_SHA"
+          fi
+
+          echo "sdk-url=$SDK_URL" >> "$GITHUB_OUTPUT"
+          echo "sdk-revision=$SDK_REVISION" >> "$GITHUB_OUTPUT"
+          echo "sdk-hash=$SDK_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "repo-url=$REPO_URL" >> "$GITHUB_OUTPUT"
+          echo "repo-hash=$REPO_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: 🧰 Cache + Install Apt Dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: >-
+            git cmake ninja-build gperf dfu-util device-tree-compiler wget
+            python3-dev python3-pip python3-setuptools python3-tk python3-wheel python3-venv
+            xz-utils file make gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
+          version: 1.0
+
+      - name: 📦 Cache Zephyr SDK
+        id: cache-sdk
+        uses: actions/cache@v5
+        with:
+          path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}-${{ runner.os }}-${{ runner.arch }}-gnu-arm
+
+      - name: 🪁 Install Zephyr SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${{ env.ZEPHYR_SDK_VERSION }}/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz
+          tar xf zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz -C ~/
+          ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}/setup.sh -c -t arm-zephyr-eabi
+
+      - name: 🐍 Cache Python venv
+        id: cache-venv
+        uses: actions/cache@v5
+        with:
+          path: ~/.venv
+          key: venv-cheesecake-py3.12-${{ steps.vars.outputs.sdk-hash }}
+
+      - name: 🐍 Setup Python venv
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          python3.12 -m venv ~/.venv
+          ~/.venv/bin/pip install --upgrade pip
+          ~/.venv/bin/pip install west ninja
+
+      - name: 📦 Cache West Workspace
+        id: cache-west
+        uses: actions/cache@v5
+        with:
+          path: |
+            zephyr-workspace/.west
+            zephyr-workspace/zephyr
+            zephyr-workspace/nrf
+            zephyr-workspace/modules
+            zephyr-workspace/nrfxlib
+            zephyr-workspace/bootloader
+            zephyr-workspace/tools
+          key: west-cheesecake-${{ steps.vars.outputs.sdk-hash }}
+
+      - name: ♻️ Initialize Zephyr Workspace
+        run: |
+          echo "$HOME/.venv/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.venv/bin:$PATH"
+          cd zephyr-workspace
+          if [ ! -d ".west" ]; then
+            west init -l "$REPO_DIR"
+          fi
+          west update --narrow -o=--depth=1
+          west zephyr-export
+
+      - name: 🐍 Install Python Requirements
+        run: |
+          export PATH="$HOME/.venv/bin:$PATH"
+          cd zephyr-workspace
+          ~/.venv/bin/pip install \
+            -r zephyr/scripts/requirements.txt \
+            -r nrf/scripts/requirements-build.txt \
+            -r bootloader/mcuboot/scripts/requirements.txt
+
+  build:
+    needs: setup
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- 基线：原厂配置（对照组）----
+          - variant: p10
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10
+            conf: ""
+          - variant: p00
+            board: sk_cheesecake_nrf_p00/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P00
+            conf: ""
+
+          # ---- 稳定性 / 诊断 ----
+          - variant: nowom
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_nowom
+            conf: nowom.conf
+          - variant: noheater
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_noheater
+            conf: noheater.conf
+
+          # ---- 精度 / 功耗 ----
+          - variant: bootcal
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_bootcal
+            conf: bootcal.conf
+          - variant: eqf
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_eqf
+            conf: eqf.conf
+          - variant: vqf-fixed
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_vqffixed
+            conf: vqf-fixed.conf
+          - variant: lowpower
+            board: sk_cheesecake_nrf_p10/nrf52840/uf2
+            artifact: SlimeNRF_CheeseCake_P10_lowpower
+            conf: lowpower.conf
+    steps:
+      - name: 💻 Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          path: zephyr-workspace/${{ env.REPO_DIR }}
+          submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: 🧰 Cache + Install Apt Dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: >-
+            git cmake ninja-build gperf dfu-util device-tree-compiler wget
+            python3-dev python3-pip python3-setuptools python3-tk python3-wheel python3-venv
+            xz-utils file make gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
+          version: 1.0
+
+      - name: 📦 Restore Zephyr SDK
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}-${{ runner.os }}-${{ runner.arch }}-gnu-arm
+          fail-on-cache-miss: true
+
+      - name: 🪁 Register Zephyr SDK
+        run: |
+          ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}/setup.sh -c -t arm-zephyr-eabi
+          echo "ZEPHYR_SDK_INSTALL_DIR=$HOME/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}" >> "$GITHUB_ENV"
+
+      - name: 📦 Restore West Workspace
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            zephyr-workspace/.west
+            zephyr-workspace/zephyr
+            zephyr-workspace/nrf
+            zephyr-workspace/modules
+            zephyr-workspace/nrfxlib
+            zephyr-workspace/bootloader
+            zephyr-workspace/tools
+          key: west-cheesecake-${{ needs.setup.outputs.sdk-hash }}
+          fail-on-cache-miss: true
+
+      - name: 🐍 Restore Python venv
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.venv
+          key: venv-cheesecake-py3.12-${{ needs.setup.outputs.sdk-hash }}
+          fail-on-cache-miss: true
+
+      - name: ♻️ Register Zephyr Workspace
+        run: |
+          echo "$HOME/.venv/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.venv/bin:$PATH"
+          cd zephyr-workspace
+          west zephyr-export
+
+      - name: 🧩 Apply Kconfig Variant
+        if: matrix.conf != ''
+        run: |
+          cd zephyr-workspace
+          echo "::group::Variant ${{ matrix.variant }} — ${{ matrix.conf }}"
+          cat "$REPO_DIR/.github/ci/cheesecake/${{ matrix.conf }}"
+          echo "::endgroup::"
+          cat "$REPO_DIR/.github/ci/cheesecake/${{ matrix.conf }}" >> "$REPO_DIR/prj.conf"
+          # 提交一次，避免 CMake 的 `git describe --dirty` 把版本标记为 dirty
+          git -C "$REPO_DIR" \
+            -c user.name="ci-bot" -c user.email="ci-bot@users.noreply.github.com" \
+            commit -q -a -m "ci: apply variant ${{ matrix.variant }}"
+
+      - name: 🔨 Build ${{ matrix.artifact }}
+        run: |
+          export PATH="$HOME/.venv/bin:$PATH"
+          cd zephyr-workspace
+          BOARD_ROOT="$(pwd)/$REPO_DIR"
+          west build \
+            --board "${{ matrix.board }}" \
+            --pristine=always "$REPO_DIR" \
+            --build-dir "$REPO_DIR/build/${{ matrix.variant }}" \
+            -- -DBOARD_ROOT="$BOARD_ROOT"
+
+      - name: 📦 Collect Artifacts
+        run: |
+          cd zephyr-workspace
+          BUILD="$REPO_DIR/build/${{ matrix.variant }}"
+          mkdir -p out
+          uf2=$(find "$BUILD" -type f -name 'zephyr.uf2' -print -quit)
+          hex=$(find "$BUILD" -type f -name 'zephyr.hex' -print -quit)
+          if [ -n "$uf2" ]; then
+            cp "$uf2" "out/${{ matrix.artifact }}.uf2"
+            echo "UF2: $uf2"
+          else
+            echo "::error::zephyr.uf2 not found under $BUILD"
+            exit 1
+          fi
+          if [ -n "$hex" ]; then
+            cp "$hex" "out/${{ matrix.artifact }}.hex"
+            echo "HEX: $hex"
+          fi
+          ls -lh out/
+
+      - name: 💾 Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: zephyr-workspace/out/${{ matrix.artifact }}.*
+
+      - name: 📝 Summary
+        run: |
+          {
+            echo "### ${{ matrix.artifact }}"
+            echo ""
+            echo "- board: \`${{ matrix.board }}\`"
+            echo "- variant: \`${{ matrix.variant }}\`"
+            echo "- kconfig: \`${{ matrix.conf }}\`"
+            echo "- commit: \`${{ needs.setup.outputs.repo-hash }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
