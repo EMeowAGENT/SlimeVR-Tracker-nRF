@@ -49,6 +49,17 @@ bool sensor_motion_is_active(
 	float lin_accel_ms2,
 	float quat_delta_rad,
 	const struct sensor_rest_evidence *evidence);
+/* Bitmask of the quiet criteria for remote diagnosis:
+ * 0x01 accel evidence valid, 0x02 accel deviation ok,
+ * 0x04 linear accel ok, 0x08 quaternion angle ok.
+ * Never used for decisions; the decision itself stays in sensor_motion_is_quiet. */
+uint8_t sensor_motion_quiet_code(
+	float lin_accel_ms2,
+	float quat_delta_rad,
+	const struct sensor_rest_evidence *evidence);
+/* Last published quiet-code, plus 0x10 = channels fresh/known and
+ * 0x20 = frame invalid. Zero means "no evidence at all". */
+uint8_t sensor_motion_rest_code(void);
 bool sensor_activity_score_update(
 	struct sensor_activity_score *state,
 	float angular_speed_dps,

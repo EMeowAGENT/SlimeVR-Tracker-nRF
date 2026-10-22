@@ -586,6 +586,8 @@ static inline void sensor_rotate_sensor_vector_to_device_frame(const float *sens
 /* Upper-motion state is owned exclusively by the sensor thread. Lifecycle
  * callers invalidate the event epoch; they never reset these filters. */
 static struct sensor_rest_detector rest_detector;
+/* Bitmask telemetry for the rest decision; read by heated T-Cal diagnostics. */
+static atomic_t motion_rest_code;
 static struct {
 	uint32_t epoch;
 	bool epoch_valid, initialized, resting, previous_valid, frame_invalid;
@@ -609,6 +611,16 @@ static void sensor_motion_reset(void)
 static bool sensor_motion_frame_current(uint32_t epoch)
 {
 	return !atomic_get(&main_suspended) && epoch == tracker_events_sensor_epoch();
+}
+
+uint8_t sensor_motion_rest_code(void)
+{
+	return (uint8_t)atomic_get(&motion_rest_code);
+}
+
+static void sensor_motion_publish_rest_code(uint8_t code)
+{
+	atomic_set(&motion_rest_code, code);
 }
 
 static uint32_t sensor_motion_freshness_ms(float period_s)
@@ -688,6 +700,7 @@ static bool sensor_motion_observe(
 		|| !v_finite(&norm2, 1) || norm2 <= 0.0f || !v_finite(lin_a, 3)
 		|| (a_count > 0 && !evidence.accel_valid)) {
 		sensor_motion_reset();
+		sensor_motion_publish_rest_code(0);
 		return false;
 	}
 	if (g_count > 0) sensor_motion_state.gyro_ms = now;
@@ -701,6 +714,7 @@ static bool sensor_motion_observe(
 	if (!known) {
 		sensor_motion_state.initialized = sensor_motion_state.resting = sensor_motion_state.previous_valid = false;
 		sensor_motion_state.quiet_ms = sensor_motion_state.motion_ms = 0;
+		sensor_motion_publish_rest_code(0);
 		return false;
 	}
 	if (g_count == 0 && a_count == 0) {
@@ -713,6 +727,7 @@ static bool sensor_motion_observe(
 	float squared = lin_a[0]*lin_a[0] + lin_a[1]*lin_a[1] + lin_a[2]*lin_a[2];
 	if (!v_finite(&squared, 1)) {
 		sensor_motion_reset();
+		sensor_motion_publish_rest_code(0);
 		return false;
 	}
 	*linear = sqrtf(squared);
@@ -738,6 +753,10 @@ static bool sensor_motion_observe(
 	}
 #endif
 	float angle = sensor_motion_quat_angle(sensor_motion_state.reference_q, current_q);
+	uint8_t quiet_code = sensor_motion_quiet_code(*linear, angle, &evidence);
+	quiet_code |= 0x10; /* channels fresh: known was established above */
+	quiet_code |= sensor_motion_state.frame_invalid ? 0x20 : 0;
+	sensor_motion_publish_rest_code(quiet_code);
 	uint32_t dt = elapsed > 0 ? (uint32_t)elapsed : 0;
 	if (sensor_motion_state.resting) {
 		if (sensor_motion_is_active(*linear, angle, &evidence)) {

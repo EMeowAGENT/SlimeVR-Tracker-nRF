@@ -7,6 +7,7 @@
 #include "tcal_runtime.h"
 #include "tcal_mls_lut.h"
 #include "sensor/sensor.h"
+#include "sensor/motion_state.h"
 #include "system/heater.h"
 #include "system/power.h"
 #include "system/system.h"
@@ -768,29 +769,42 @@ void sensor_tcal_heated_update(bool is_resting)
 			/* Coalesced progress: phase distinguishes active sampling from a
 			 * motion/rise pause; detail carries filtered temperature in C. */
 			if (heat.op) {
-				/* cal_event_step coalesces per operation, so the three traces
-				 * rotate instead of overwriting each other:
-				 *   COLLECT/WAIT_STILL  detail = filtered temperature (C)
-				 *   PROBATION           detail = heater duty (%)
-				 *   RETRY               detail = accumulated samples / 100
-				 * The third one shows how close the first window is to its
-				 * minimum instead of leaving the failure invisible. */
+				/* cal_event_step coalesces per operation, so the traces rotate
+				 * instead of overwriting each other (one trace per second):
+				 *   COLLECT/WAIT_STILL  filtered temperature (C)
+				 *   PROBATION           heater duty (%)
+				 *   FIT                 accumulated samples / 100
+				 *   IDENTIFY            rest-criteria bitmask:
+				 *     0x01 accel evidence valid   0x02 accel deviation ok
+				 *     0x04 linear accel ok        0x08 quat angle ok
+				 *     0x10 channels fresh/known   0x20 frame invalid
+				 * 0x1F means "everything says quiet"; a missing bit names the
+				 * criterion that blocks sampling.
+				 */
 				static uint32_t telemetry_tick;
-				uint32_t slot = telemetry_tick++ % 3U;
-				if (slot == 1U) {
+				switch (telemetry_tick++ % 4U) {
+				case 1U:
 					cal_event_step(heat.op, CAL_PHASE_PROBATION,
 						       (uint8_t)(heat.duty / 100U));
-				} else if (slot == 2U) {
+					break;
+				case 2U: {
 					uint16_t samples = tcal_accum_observed_count();
-					cal_event_step(heat.op, CAL_PHASE_RETRY,
+					cal_event_step(heat.op, CAL_PHASE_FIT,
 						       (uint8_t)(samples / 100U > 255U ? 255U
 										  : samples / 100U));
-				} else {
+					break;
+				}
+				case 3U:
+					cal_event_step(heat.op, CAL_PHASE_IDENTIFY,
+						       sensor_motion_rest_code());
+					break;
+				default:
 					cal_event_step(heat.op,
 						       heat.sampling ? CAL_PHASE_COLLECT
 								     : CAL_PHASE_WAIT_STILL,
 						       (uint8_t)CLAMP(observation.filtered_c + 0.5f,
 								      0.0f, 255.0f));
+					break;
 				}
 			}
 		}

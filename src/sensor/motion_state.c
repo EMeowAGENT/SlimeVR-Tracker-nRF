@@ -101,6 +101,28 @@ bool sensor_motion_is_quiet(
 		&& quat_delta_rad < REST_ENTER_QUAT_RAD;
 }
 
+uint8_t sensor_motion_quiet_code(
+	float lin_accel_ms2,
+	float quat_delta_rad,
+	const struct sensor_rest_evidence *evidence)
+{
+	uint8_t code = 0;
+	if (evidence->accel_valid) {
+		code |= 0x01;
+	}
+	if (evidence->accel_deviation_squared_m2_s4 <
+	    REST_ENTER_ACCEL_DEV_MS2 * REST_ENTER_ACCEL_DEV_MS2) {
+		code |= 0x02;
+	}
+	if (lin_accel_ms2 < REST_ENTER_LIN_ACCEL_MS2) {
+		code |= 0x04;
+	}
+	if (quat_delta_rad < REST_ENTER_QUAT_RAD) {
+		code |= 0x08;
+	}
+	return code;
+}
+
 bool sensor_motion_is_active(
 	float lin_accel_ms2,
 	float quat_delta_rad,
