@@ -588,6 +588,7 @@ static inline void sensor_rotate_sensor_vector_to_device_frame(const float *sens
 static struct sensor_rest_detector rest_detector;
 /* Bitmask telemetry for the rest decision; read by heated T-Cal diagnostics. */
 static atomic_t motion_rest_code;
+static atomic_t motion_rest_latch;
 static struct {
 	uint32_t epoch;
 	bool epoch_valid, initialized, resting, previous_valid, frame_invalid;
@@ -621,6 +622,16 @@ uint8_t sensor_motion_rest_code(void)
 static void sensor_motion_publish_rest_code(uint8_t code)
 {
 	atomic_set(&motion_rest_code, code);
+	/* Latch the first frame that breaks any quiet criterion so a periodic
+	 * telemetry read cannot step over a short disturbance. */
+	if ((code & 0x1F) != 0x1F) {
+		atomic_cas(&motion_rest_latch, 0, code);
+	}
+}
+
+uint8_t sensor_motion_rest_code_latched(void)
+{
+	return (uint8_t)atomic_set(&motion_rest_latch, 0);
 }
 
 static uint32_t sensor_motion_freshness_ms(float period_s)

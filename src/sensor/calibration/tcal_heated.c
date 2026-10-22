@@ -794,10 +794,13 @@ void sensor_tcal_heated_update(bool is_resting)
 										  : samples / 100U));
 					break;
 				}
-				case 3U:
+				case 3U: {
+					uint8_t latched = sensor_motion_rest_code_latched();
 					cal_event_step(heat.op, CAL_PHASE_IDENTIFY,
-						       sensor_motion_rest_code());
+						       latched ? latched
+							       : sensor_motion_rest_code());
 					break;
+				}
 				default:
 					cal_event_step(heat.op,
 						       heat.sampling ? CAL_PHASE_COLLECT

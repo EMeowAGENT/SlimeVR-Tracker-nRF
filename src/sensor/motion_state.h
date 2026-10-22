@@ -60,6 +60,9 @@ uint8_t sensor_motion_quiet_code(
 /* Last published quiet-code, plus 0x10 = channels fresh/known and
  * 0x20 = frame invalid. Zero means "no evidence at all". */
 uint8_t sensor_motion_rest_code(void);
+/* First failing quiet-code seen since the last read, then zero. Lets
+ * telemetry catch a one-frame failure that a periodic sample would miss. */
+uint8_t sensor_motion_rest_code_latched(void);
 bool sensor_activity_score_update(
 	struct sensor_activity_score *state,
 	float angular_speed_dps,
