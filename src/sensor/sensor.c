@@ -411,6 +411,11 @@ static bool temperature_observation_enabled;
 static uint32_t temperature_filter_epoch;
 static uint32_t temperature_epoch;
 static bool heated_resting;
+/* A frame without new gyro/accel samples is not evidence of motion. Held for
+ * a bounded time so an empty or stale loop iteration cannot reset the heated
+ * sampler's rest gate (which froze the ramp silently). */
+#define HEATED_REST_HOLD_MS 2000
+static int64_t heated_rest_evidenced_ms;
 
 int sensor_get_imu_temperature_observation(
 	struct sensor_temperature_observation *out, int64_t max_age_ms)
@@ -3102,8 +3107,8 @@ static void sensor_loop_publish(sensor_loop_frame_t *frame)
 	bool frame_current = sensor_motion_frame_current(frame->sensor_epoch);
 	resting = resting && observed && frame_current;
 #if CONFIG_SENSOR_TCAL_HEATED
-	/* Publish the gate that actually decides heated_resting: the quit criteria
-	 * can all pass while an empty frame or a stale epoch still blocks sampling. */
+	/* Publish the gate that decides heated_resting: the quiet criteria can all
+	 * pass while an empty frame or a stale epoch still blocks sampling. */
 	uint8_t gate_code = sensor_motion_rest_code();
 	if (!observed) {
 		gate_code |= 0x40;
@@ -3112,8 +3117,16 @@ static void sensor_loop_publish(sensor_loop_frame_t *frame)
 		gate_code |= 0x80;
 	}
 	sensor_motion_publish_rest_code(gate_code);
-	heated_resting = resting;
-	sensor_tcal_heated_update(resting);
+	if (frame_current && observed) {
+		heated_rest_evidenced_ms = now;
+		heated_resting = resting;
+	} else if (!frame_current || heated_rest_evidenced_ms == 0 ||
+		   now - heated_rest_evidenced_ms > HEATED_REST_HOLD_MS) {
+		/* Suspend/epoch change, or no fresh evidence for too long. */
+		heated_resting = false;
+	}
+	/* else: hold the previous decision across this no-evidence frame. */
+	sensor_tcal_heated_update(heated_resting);
 #endif
 	if (observed && sensor_motion_frame_current(frame->sensor_epoch)) {
 		if (angular_speed_dps >= 0.0f)
