@@ -846,8 +846,9 @@ static void tcal_accum_flush(bool heated)
 #if CONFIG_SENSOR_TCAL_HEATED
 	if (heated) {
 		/* Reset requests also invalidate already-computed heated windows. */
+		bool anchor = sensor_tcal_heated_first_point_pending();
 		if (tcal_accum.reset_generation == (uint32_t)atomic_get(&tcal_accum_reset_generation) &&
-		    idx == tcal_accum.slot) {
+		    (anchor || idx == tcal_accum.slot)) {
 			sensor_tcal_heated_accept_point(idx, avg_bias, avg_temp);
 		}
 		tcal_accum_reset();
@@ -889,6 +890,13 @@ static void tcal_accum_feed(const float g[3], float temp, bool heated)
 		if (temp >= CONFIG_SENSOR_POLY_TEMP_MAX || slot < 0 || slot >= TCAL_BUFFER_SIZE) {
 			tcal_accum_reset();
 			return;
+		}
+		/* The anchor point must not depend on bucket stability: a chip sitting
+		 * exactly on a 0.5 C boundary flips slots on 0.01 C of noise, and the
+		 * confirmation path below then starves every sample. The flush accepts
+		 * this window by its mean temperature instead of the start slot. */
+		if (sensor_tcal_heated_first_point_pending()) {
+			slot = tcal_accum.active ? tcal_accum.slot : slot;
 		}
 		if (tcal_accum.active && slot != tcal_accum.slot) {
 			if (tcal_accum.pending_slot != slot) {
