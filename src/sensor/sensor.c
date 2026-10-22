@@ -624,7 +624,7 @@ static void sensor_motion_publish_rest_code(uint8_t code)
 	atomic_set(&motion_rest_code, code);
 	/* Latch the first frame that breaks any quiet criterion so a periodic
 	 * telemetry read cannot step over a short disturbance. */
-	if ((code & 0x1F) != 0x1F) {
+	if (code != 0x1F) {
 		atomic_cas(&motion_rest_latch, 0, code);
 	}
 }
@@ -3099,8 +3099,19 @@ static void sensor_loop_publish(sensor_loop_frame_t *frame)
 	}
 	/* Validate before local power/calibration consumers, not just telemetry.
 	 * Empty or unknown evidence never grants sleeping/calibration eligibility. */
-	resting = resting && observed && sensor_motion_frame_current(frame->sensor_epoch);
+	bool frame_current = sensor_motion_frame_current(frame->sensor_epoch);
+	resting = resting && observed && frame_current;
 #if CONFIG_SENSOR_TCAL_HEATED
+	/* Publish the gate that actually decides heated_resting: the quit criteria
+	 * can all pass while an empty frame or a stale epoch still blocks sampling. */
+	uint8_t gate_code = sensor_motion_rest_code();
+	if (!observed) {
+		gate_code |= 0x40;
+	}
+	if (!frame_current) {
+		gate_code |= 0x80;
+	}
+	sensor_motion_publish_rest_code(gate_code);
 	heated_resting = resting;
 	sensor_tcal_heated_update(resting);
 #endif
