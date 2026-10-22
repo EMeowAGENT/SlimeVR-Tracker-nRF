@@ -53,6 +53,9 @@ LOG_MODULE_REGISTER(cal_tcal_runtime, LOG_LEVEL_INF);
  * enough for it (>= TCAL_ACCUM_MIN_SAMPLES) and makes vibration tolerable. */
 #define TCAL_ACCUM_FIRST_FLUSH_INTERVAL_MS 8000
 #define TCAL_ACCUM_MIN_SAMPLES 2000
+/* The first heated point only anchors the held band; 800 samples (~1.7 s at
+ * 469 Hz) is enough and survives a vibration-interrupted window. */
+#define TCAL_ACCUM_FIRST_MIN_SAMPLES 800
 #define TCAL_ACCUM_TEMP_DRIFT_MAX 0.53f
 #define TCAL_ACCUM_GYRO_RANGE_THRESHOLD 5.0f /* dps, windowed-mean range method */
 #define TCAL_ACCUM_GYRO_MOTION_WINDOW_MS 250 /* ms - smooth raw gyro noise before range check */
@@ -978,11 +981,14 @@ static void tcal_accum_feed(const float g[3], float temp, bool heated)
 		tcal_accum.last_sample_time = k_uptime_get();
 		/* The held starting band cannot exit until this first point exists.
 		 * All later slots finish on confirmed exit or normal target dwell. */
-		int64_t flush_interval = sensor_tcal_heated_first_point_pending() ?
-			TCAL_ACCUM_FIRST_FLUSH_INTERVAL_MS : TCAL_ACCUM_FLUSH_INTERVAL_MS;
+		bool first_point = sensor_tcal_heated_first_point_pending();
+		int64_t flush_interval = first_point ? TCAL_ACCUM_FIRST_FLUSH_INTERVAL_MS
+						     : TCAL_ACCUM_FLUSH_INTERVAL_MS;
+		int min_samples = first_point ? TCAL_ACCUM_FIRST_MIN_SAMPLES
+					      : TCAL_ACCUM_MIN_SAMPLES;
 		if (sensor_tcal_heated_start_window(temp) &&
 		    k_uptime_get() - tcal_accum.start_time >= flush_interval &&
-		    tcal_accum.observed_count >= TCAL_ACCUM_MIN_SAMPLES) {
+		    tcal_accum.observed_count >= min_samples) {
 			tcal_accum_flush(true);
 		}
 		return;
@@ -2305,4 +2311,10 @@ void sensor_tcal_backup_command(size_t argc, char **argv, uint32_t input_generat
 	k_free(packet);
 }
 
+uint16_t tcal_accum_observed_count(void)
+{
+	return tcal_accum.observed_count > 65535 ? 65535 : (uint16_t)tcal_accum.observed_count;
+}
+
 #endif /* CONFIG_SENSOR_USE_TCAL */
+

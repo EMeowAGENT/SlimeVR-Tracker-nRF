@@ -25,7 +25,7 @@ LOG_MODULE_REGISTER(tcal_heated, LOG_LEVEL_INF);
 #define HEAT_CONTROL_MS 1000
 /* Brief desk vibration must not wipe the accumulator: only sustained motion
  * resets it, so a 3 s still window can still contribute samples. */
-#define HEAT_MOTION_GRACE_MS 2000
+#define HEAT_MOTION_GRACE_MS 10000
 /* Without any accepted start-band point the session can never ramp. Fail
  * loudly instead of silently burning the 90 min session budget. */
 #define HEAT_FIRST_POINT_TIMEOUT_MS 180000
@@ -768,15 +768,23 @@ void sensor_tcal_heated_update(bool is_resting)
 			/* Coalesced progress: phase distinguishes active sampling from a
 			 * motion/rise pause; detail carries filtered temperature in C. */
 			if (heat.op) {
-				/* cal_event_step coalesces per operation, so temperature
-				 * and heater drive alternate instead of overwriting each
-				 * other. PROBATION carries duty in percent: detail==0 with a
-				 * flat temperature proves the heater was never asked to
-				 * work, which is different from a broken heater. */
+				/* cal_event_step coalesces per operation, so the three traces
+				 * rotate instead of overwriting each other:
+				 *   COLLECT/WAIT_STILL  detail = filtered temperature (C)
+				 *   PROBATION           detail = heater duty (%)
+				 *   RETRY               detail = accumulated samples / 100
+				 * The third one shows how close the first window is to its
+				 * minimum instead of leaving the failure invisible. */
 				static uint32_t telemetry_tick;
-				if (telemetry_tick++ & 1U) {
+				uint32_t slot = telemetry_tick++ % 3U;
+				if (slot == 1U) {
 					cal_event_step(heat.op, CAL_PHASE_PROBATION,
 						       (uint8_t)(heat.duty / 100U));
+				} else if (slot == 2U) {
+					uint16_t samples = tcal_accum_observed_count();
+					cal_event_step(heat.op, CAL_PHASE_RETRY,
+						       (uint8_t)(samples / 100U > 255U ? 255U
+										  : samples / 100U));
 				} else {
 					cal_event_step(heat.op,
 						       heat.sampling ? CAL_PHASE_COLLECT

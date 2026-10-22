@@ -113,6 +113,10 @@ int sensor_perform_runtime_calibration(void);
  * in tcal_runtime.c.
  */
 
+/* Coalesced telemetry: samples accumulated in the current heated window. */
+uint16_t tcal_accum_observed_count(void);
+
 #endif /* CONFIG_SENSOR_USE_TCAL */
+
 
 #endif /* SLIMENRF_CAL_TCAL_RUNTIME_H */
