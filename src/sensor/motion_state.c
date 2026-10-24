@@ -88,6 +88,10 @@ void sensor_rest_detector_take(struct sensor_rest_detector *state, struct sensor
 #define REST_ENTER_QUAT_RAD (0.60f * (3.14159265358979323846f / 180.0f))
 #define REST_EXIT_QUAT_RAD (1.20f * (3.14159265358979323846f / 180.0f))
 #define REST_ENTER_ACCEL_DEV_MS2 0.10f
+/* Heated-session rotation budget, in deg/s. Extrapolated T-Cal drift is well
+ * below 0.2 deg/s; deliberate rotation is far above 1 deg/s. */
+#define REST_ENTER_RATE_DPS 1.0f
+#define REST_EXIT_RATE_DPS 2.0f
 #define REST_EXIT_ACCEL_DEV_MS2 0.25f
 
 bool sensor_motion_is_quiet(
@@ -99,6 +103,50 @@ bool sensor_motion_is_quiet(
 		&& evidence->accel_deviation_squared_m2_s4 < REST_ENTER_ACCEL_DEV_MS2 * REST_ENTER_ACCEL_DEV_MS2
 		&& lin_accel_ms2 < REST_ENTER_LIN_ACCEL_MS2
 		&& quat_delta_rad < REST_ENTER_QUAT_RAD;
+}
+
+bool sensor_motion_is_quiet_rated(
+	float angular_rate_dps,
+	float lin_accel_ms2,
+	const struct sensor_rest_evidence *evidence)
+{
+	return evidence->accel_valid
+		&& evidence->accel_deviation_squared_m2_s4 < REST_ENTER_ACCEL_DEV_MS2 * REST_ENTER_ACCEL_DEV_MS2
+		&& lin_accel_ms2 < REST_ENTER_LIN_ACCEL_MS2
+		&& angular_rate_dps < REST_ENTER_RATE_DPS;
+}
+
+bool sensor_motion_is_active_rated(
+	float angular_rate_dps,
+	float lin_accel_ms2,
+	const struct sensor_rest_evidence *evidence)
+{
+	return (evidence->accel_valid
+			&& evidence->accel_deviation_squared_m2_s4 > REST_EXIT_ACCEL_DEV_MS2 * REST_EXIT_ACCEL_DEV_MS2)
+		|| lin_accel_ms2 > REST_EXIT_LIN_ACCEL_MS2
+		|| angular_rate_dps > REST_EXIT_RATE_DPS;
+}
+
+uint8_t sensor_motion_quiet_code_rated(
+	float angular_rate_dps,
+	float lin_accel_ms2,
+	const struct sensor_rest_evidence *evidence)
+{
+	uint8_t code = 0;
+	if (evidence->accel_valid) {
+		code |= 0x01;
+	}
+	if (evidence->accel_deviation_squared_m2_s4 <
+	    REST_ENTER_ACCEL_DEV_MS2 * REST_ENTER_ACCEL_DEV_MS2) {
+		code |= 0x02;
+	}
+	if (lin_accel_ms2 < REST_ENTER_LIN_ACCEL_MS2) {
+		code |= 0x04;
+	}
+	if (angular_rate_dps < REST_ENTER_RATE_DPS) {
+		code |= 0x08;
+	}
+	return code;
 }
 
 uint8_t sensor_motion_quiet_code(

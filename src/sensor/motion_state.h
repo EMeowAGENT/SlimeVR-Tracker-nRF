@@ -57,6 +57,21 @@ uint8_t sensor_motion_quiet_code(
 	float lin_accel_ms2,
 	float quat_delta_rad,
 	const struct sensor_rest_evidence *evidence);
+/* Drift-aware variants used while a heated T-Cal session is extrapolating
+ * beyond its table: the reference angle accumulates bias drift, an angular
+ * rate does not. Same accel terms; real rotation still exceeds the budget. */
+bool sensor_motion_is_quiet_rated(
+	float angular_rate_dps,
+	float lin_accel_ms2,
+	const struct sensor_rest_evidence *evidence);
+bool sensor_motion_is_active_rated(
+	float angular_rate_dps,
+	float lin_accel_ms2,
+	const struct sensor_rest_evidence *evidence);
+uint8_t sensor_motion_quiet_code_rated(
+	float angular_rate_dps,
+	float lin_accel_ms2,
+	const struct sensor_rest_evidence *evidence);
 /* Last published quiet-code, plus 0x10 = channels fresh/known and
  * 0x20 = frame invalid. Zero means "no evidence at all". */
 uint8_t sensor_motion_rest_code(void);

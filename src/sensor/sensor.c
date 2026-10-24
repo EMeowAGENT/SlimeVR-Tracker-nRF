@@ -600,6 +600,9 @@ static struct {
 	int64_t gyro_ms, accel_ms, frame_ms, previous_ms;
 	uint32_t quiet_ms, motion_ms;
 	float reference_q[4], previous_q[4];
+	/* Frame-to-frame pair for the heated-session rate criterion. */
+	float prev_q[4];
+	bool prev_q_valid;
 } sensor_motion_state = {.gyro_ms = -1, .accel_ms = -1, .frame_ms = -1};
 
 static void sensor_motion_reset(void)
@@ -769,13 +772,35 @@ static bool sensor_motion_observe(
 	}
 #endif
 	float angle = sensor_motion_quat_angle(sensor_motion_state.reference_q, current_q);
-	uint8_t quiet_code = sensor_motion_quiet_code(*linear, angle, &evidence);
+	uint32_t dt = elapsed > 0 ? (uint32_t)elapsed : 0;
+	/* A heated session runs outside its T-Cal table, so the fixed reference
+	 * accumulates bias drift while the device is still. Judge rotation by rate
+	 * there; the absolute-angle criterion stays for every other consumer. */
+	bool heated_session = false;
+#if CONFIG_SENSOR_TCAL_HEATED
+	heated_session = sensor_tcal_heated_busy();
+#endif
+	/* Frame-to-frame angular rate. Deriving it from the reference angle would
+	 * divide a slowly drifting angle by the same window and mask real motion,
+	 * and would report drift as motion once the window is short. */
+	float rate_dps = 0.0f;
+	if (sensor_motion_state.prev_q_valid && dt > 0 && elapsed > 0) {
+		rate_dps = sensor_motion_quat_angle(sensor_motion_state.prev_q, current_q)
+			* 1000.0f / (float)elapsed;
+	}
+	memcpy(sensor_motion_state.prev_q, current_q, sizeof(sensor_motion_state.prev_q));
+	sensor_motion_state.prev_q_valid = true;
+	uint8_t quiet_code = heated_session
+		? sensor_motion_quiet_code_rated(rate_dps, *linear, &evidence)
+		: sensor_motion_quiet_code(*linear, angle, &evidence);
 	quiet_code |= 0x10; /* channels fresh: known was established above */
 	quiet_code |= sensor_motion_state.frame_invalid ? 0x20 : 0;
 	sensor_motion_publish_rest_code(quiet_code);
-	uint32_t dt = elapsed > 0 ? (uint32_t)elapsed : 0;
 	if (sensor_motion_state.resting) {
-		if (sensor_motion_is_active(*linear, angle, &evidence)) {
+		bool active = heated_session
+			? sensor_motion_is_active_rated(rate_dps, *linear, &evidence)
+			: sensor_motion_is_active(*linear, angle, &evidence);
+		if (active) {
 			/* Start the high-threshold dwell at this observation. */
 			if (sensor_motion_state.motion_ms == 0) sensor_motion_state.motion_ms = 1;
 			else sensor_motion_state.motion_ms += dt;
@@ -787,7 +812,9 @@ static bool sensor_motion_observe(
 		} else {
 			sensor_motion_state.motion_ms = 0;
 		}
-	} else if (sensor_motion_is_quiet(*linear, angle, &evidence)) {
+	} else if (heated_session
+			   ? sensor_motion_is_quiet_rated(rate_dps, *linear, &evidence)
+			   : sensor_motion_is_quiet(*linear, angle, &evidence)) {
 		if (sensor_motion_state.quiet_ms == 0) sensor_motion_state.quiet_ms = 1;
 		else sensor_motion_state.quiet_ms += dt;
 		if (sensor_motion_state.quiet_ms > SENSOR_REST_ENTER_STABLE_MS) {
