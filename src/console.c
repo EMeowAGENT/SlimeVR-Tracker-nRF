@@ -1421,7 +1421,7 @@ static void print_help(void)
 	printk("  tcal export                         One-line lossless temperature backup\n");
 	printk("  tcal import                         Wait for ready, paste backup; Ctrl-C cancels\n");
 #if CONFIG_SENSOR_TCAL_HEATED
-	printk("  tcal heat <start [temp]|stop|status> Closed-loop heated calibration\n");
+	printk("  tcal heat <start [temp]|stop|status|log <on|off>> Closed-loop heated calibration\n");
 #endif
 #endif
 	printk("\n");
@@ -1802,7 +1802,7 @@ static void console_cmd_sens(size_t argc, char **argv)
 static void console_cmd_tcal_heat(size_t argc, char **argv)
 {
 	if (argc < 3 || argc > 4) {
-		printk("Error: Use: tcal heat <start [temp]|stop|status>\n");
+		printk("Error: Use: tcal heat <start [temp]|stop|status|log <on|off>>\n");
 		console_reject();
 		return;
 	}
@@ -1825,8 +1825,20 @@ static void console_cmd_tcal_heat(size_t argc, char **argv)
 	} else if (strcmp(argv[2], "status") == 0 && argc == 3) {
 		sensor_tcal_heated_report();
 		return;
+	} else if (strcmp(argv[2], "log") == 0 && argc == 4) {
+		if (strcmp(argv[3], "on") == 0) {
+			sensor_tcal_heated_set_log(true);
+		} else if (strcmp(argv[3], "off") == 0) {
+			sensor_tcal_heated_set_log(false);
+		} else {
+			printk("Error: Use: tcal heat log <on|off>\n");
+			console_reject();
+			return;
+		}
+		printk("Heated T-Cal console trace: %s\n", sensor_tcal_heated_log_enabled() ? "on" : "off");
+		return;
 	} else {
-		printk("Error: Use: tcal heat <start [temp]|stop|status>\n");
+		printk("Error: Use: tcal heat <start [temp]|stop|status|log <on|off>>\n");
 		console_reject();
 		return;
 	}

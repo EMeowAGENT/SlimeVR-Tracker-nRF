@@ -35,6 +35,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
+#include <zephyr/sys/printk.h>
 
 #include "bias_collect.h"
 #include "calibration.h"
@@ -841,8 +842,11 @@ static void tcal_accum_flush(bool heated)
 	if (heated) {
 		/* Reset requests also invalidate already-computed heated windows. */
 		if (tcal_accum.reset_generation == (uint32_t)atomic_get(&tcal_accum_reset_generation) &&
-		    idx == tcal_accum.slot) {
-			sensor_tcal_heated_accept_point(idx, avg_bias, avg_temp);
+		    idx == tcal_accum.slot &&
+		    sensor_tcal_heated_accept_point(idx, avg_bias, avg_temp) &&
+		    sensor_tcal_heated_log_enabled()) {
+			printk("TCAL %lld EV POINT idx=%d temp=%.2f bias=%.5f,%.5f,%.5f\n", k_uptime_get(), idx,
+			       (double)avg_temp, (double)avg_bias[0], (double)avg_bias[1], (double)avg_bias[2]);
 		}
 		tcal_accum_reset();
 		return;

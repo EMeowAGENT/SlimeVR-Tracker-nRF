@@ -75,6 +75,19 @@ static struct {
 static struct TempCalPoint stage[TCAL_BUFFER_SIZE];
 static uint32_t owner_epoch;
 
+static const char *const heat_state_names[] = {"idle", "reserved", "running", "finalizing", "finished", "off-failed"};
+static const char *const heat_reason_names[] = {"none", "sensor-stop", "power-down", "user", "timeout", "stale-temperature",
+	"overtemperature", "rise-too-fast", "heater-error", "insufficient-coverage", "complete"};
+
+/* Opt-in bench trace. Flags are written under the gate and flushed only after
+ * unlocking: printk may reach USB CDC and must never hold up sensor stop or
+ * power teardown. Nothing here touches the radio. */
+static bool trace_enabled;
+static bool trace_stop_pending;
+static bool trace_apply_pending;
+
+static void heat_trace_flush(void);
+
 static enum tcal_heated_stop_reason check_locked(struct sensor_temperature_observation *observation);
 
 bool sensor_tcal_heated_busy_locked(void)
@@ -94,6 +107,53 @@ bool sensor_tcal_heated_busy(void)
 	bool busy = sensor_tcal_heated_busy_locked();
 	sensor_tcal_heated_unlock();
 	return busy;
+}
+
+void sensor_tcal_heated_set_log(bool enabled)
+{
+	sensor_tcal_heated_lock();
+	trace_enabled = enabled;
+	/* Never carry a pending transition across an on/off change. */
+	trace_stop_pending = false;
+	trace_apply_pending = false;
+	sensor_tcal_heated_unlock();
+}
+
+bool sensor_tcal_heated_log_enabled(void)
+{
+	return trace_enabled;
+}
+
+/* Caller must not hold the gate. Emits only terminal transitions, so a whole
+ * session costs a handful of lines regardless of its duration. */
+static void heat_trace_flush(void)
+{
+	if (!trace_enabled) {
+		return;
+	}
+	sensor_tcal_heated_lock();
+	bool stop = trace_stop_pending;
+	bool apply = trace_apply_pending;
+	trace_stop_pending = false;
+	trace_apply_pending = false;
+	enum heat_state state = heat.state;
+	enum tcal_heated_stop_reason reason = heat.reason;
+	uint16_t count = heat.count;
+	float minimum = heat.accepted_min;
+	float maximum = heat.accepted_max;
+	bool applied = heat.applied;
+	sensor_tcal_heated_unlock();
+	if (stop) {
+		printk("TCAL %lld EV STOP state=%s reason=%s points=%u", k_uptime_get(), heat_state_names[state],
+		       heat_reason_names[reason], count);
+		if (count) {
+			printk(" min=%.2f max=%.2f", (double)minimum, (double)maximum);
+		}
+		printk(" applied=%u\n", applied ? 1U : 0U);
+	}
+	if (apply) {
+		printk("TCAL %lld EV APPLIED points=%u\n", k_uptime_get(), count);
+	}
 }
 
 static bool heat_safety_reason(enum tcal_heated_stop_reason reason)
@@ -159,6 +219,7 @@ static int finish_locked(enum tcal_heated_stop_reason reason)
 		heat.reason = reason;
 		heat.state = err ? HEAT_OFF_FAILED : HEAT_FINISHED;
 		heat.sampling = false;
+		trace_stop_pending = true;
 		tcal_accum_request_reset();
 		heat.duty = 0;
 		heat.epoch++;
@@ -193,6 +254,7 @@ int sensor_tcal_heated_abort(enum tcal_heated_stop_reason reason)
 	}
 	int err = finish_locked(reason);
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
 	return err;
 }
 
@@ -205,6 +267,7 @@ int sensor_tcal_heated_stop(void)
 		if (reason != TCAL_HEATED_STOP_NONE) {
 			int err = finish_locked(reason);
 			sensor_tcal_heated_unlock();
+			heat_trace_flush();
 			return err;
 		}
 	}
@@ -230,6 +293,7 @@ int sensor_tcal_heated_stop(void)
 		led_request_event(LED_OWNER_TCAL, led_request_id(), led_event_id(), LED_CANCELLED);
 	}
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
 	return err;
 }
 
@@ -246,6 +310,7 @@ void sensor_tcal_heated_set_ready(bool ready)
 		(void)finish_locked(TCAL_HEATED_STOP_SENSOR_STOP);
 	}
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
 }
 
 void sensor_tcal_heated_clear_begin(void)
@@ -259,6 +324,7 @@ void sensor_tcal_heated_clear_begin(void)
 	}
 	(void)finish_locked(TCAL_HEATED_STOP_SENSOR_STOP);
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
 }
 
 void sensor_tcal_heated_clear_end(void)
@@ -370,6 +436,9 @@ int sensor_tcal_heated_start(float target_temp)
 	if (!v_finite(&target_temp, 1) || target_temp < CONFIG_SENSOR_POLY_TEMP_MIN ||
 	    target_temp > CONFIG_SENSOR_TCAL_HEATED_MAX_TEMP_C - 2.0f ||
 	    target_temp >= CONFIG_SENSOR_POLY_TEMP_MAX || target_temp == 0.0f) {
+		if (trace_enabled) {
+			printk("TCAL %lld EV REJECT err=%d\n", k_uptime_get(), -EINVAL);
+		}
 		return sensor_operation_result(LED_OWNER_TCAL, -EINVAL, false);
 	}
 	sensor_tcal_heated_lock();
@@ -459,7 +528,17 @@ int sensor_tcal_heated_start(float target_temp)
 			led_fault_publish(LED_OWNER_TCAL, LED_FAULT_NONE, 0);
 		}
 	}
+	float start_temp = err ? 0.0f : heat.start_temp;
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
+	if (trace_enabled) {
+		if (err) {
+			printk("TCAL %lld EV REJECT err=%d\n", k_uptime_get(), err);
+		} else {
+			printk("TCAL %lld EV START target=%.2f start=%.2f\n", k_uptime_get(),
+			       (double)target_temp, (double)start_temp);
+		}
+	}
 	return err ? sensor_operation_result(LED_OWNER_TCAL, err, false) : 0;
 }
 
@@ -478,16 +557,16 @@ static void sync_owner_locked(void)
 	}
 }
 
-void sensor_tcal_heated_accept_point(int idx, const float bias[3], float temp)
+bool sensor_tcal_heated_accept_point(int idx, const float bias[3], float temp)
 {
 	if (heat.state != HEAT_RUNNING || !heat.sampling || owner_epoch != heat.epoch ||
 	    !v_finite(&temp, 1) || !v_finite(bias, 3) || temp == 0.0f ||
 	    temp < CONFIG_SENSOR_POLY_TEMP_MIN || temp >= CONFIG_SENSOR_POLY_TEMP_MAX ||
 	    idx < 0 || idx >= TCAL_BUFFER_SIZE || TEMP_TO_IDX(temp) != idx) {
-		return;
+		return false;
 	}
 	if (stage[idx].temp != 0.0f) {
-		return;
+		return false;
 	}
 	heat.count++;
 	stage[idx].temp = temp;
@@ -495,6 +574,7 @@ void sensor_tcal_heated_accept_point(int idx, const float bias[3], float temp)
 	heat.accepted_min = fminf(heat.accepted_min, temp);
 	heat.accepted_max = fmaxf(heat.accepted_max, temp);
 	heat.start_band_covered |= fabsf(temp - heat.start_temp) <= 1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE;
+	return true;
 }
 
 bool sensor_tcal_heated_slot_accepted(int idx)
@@ -525,6 +605,7 @@ void sensor_tcal_heated_update(bool is_resting)
 {
 	sensor_tcal_heated_lock();
 	sync_owner_locked();
+	bool sampling_before = heat.sampling;
 	if (heat.state != HEAT_RUNNING && heat.state != HEAT_FINALIZING) {
 		sensor_tcal_heated_unlock();
 		return;
@@ -535,6 +616,7 @@ void sensor_tcal_heated_update(bool is_resting)
 	if (reason != TCAL_HEATED_STOP_NONE) {
 		(void)finish_locked(reason);
 		sensor_tcal_heated_unlock();
+		heat_trace_flush();
 		return;
 	}
 	if (heat.state == HEAT_FINALIZING) {
@@ -570,6 +652,7 @@ void sensor_tcal_heated_update(bool is_resting)
 	if (reason != TCAL_HEATED_STOP_NONE) {
 		(void)finish_locked(reason);
 		sensor_tcal_heated_unlock();
+		heat_trace_flush();
 		return;
 	}
 	bool control_due = elapsed >= HEAT_CONTROL_MS;
@@ -616,6 +699,7 @@ void sensor_tcal_heated_update(bool is_resting)
 		if (!v_finite(&desired, 1)) {
 			(void)finish_locked(TCAL_HEATED_STOP_HEATER_ERROR);
 			sensor_tcal_heated_unlock();
+			heat_trace_flush();
 			return;
 		}
 		heat.duty = (uint16_t)desired;
@@ -625,6 +709,7 @@ void sensor_tcal_heated_update(bool is_resting)
 		if (heater_hw_write(heat.epoch, observation.sequence, observation.sampled_at_ms, observation.raw_c, heat.duty)) {
 			(void)finish_locked(TCAL_HEATED_STOP_HEATER_ERROR);
 			sensor_tcal_heated_unlock();
+			heat_trace_flush();
 			return;
 		}
 	}
@@ -649,7 +734,17 @@ void sensor_tcal_heated_update(bool is_resting)
 	} else {
 		heat.stable_since = -1;
 	}
+	bool sampling_now = heat.sampling;
+	float trace_temp = observation.filtered_c;
+	float trace_setpoint = heat.setpoint;
+	uint16_t trace_duty = heat.duty;
+	uint16_t trace_count = heat.count;
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
+	if (trace_enabled && sampling_now != sampling_before) {
+		printk("TCAL %lld EV SAMPLING %s temp=%.2f setpoint=%.2f duty=%u count=%u\n", k_uptime_get(),
+		       sampling_now ? "on" : "off", (double)trace_temp, (double)trace_setpoint, trace_duty, trace_count);
+	}
 }
 
 static bool qualified_locked(void)
@@ -692,6 +787,7 @@ void sensor_tcal_heated_finalize(void)
 	bool finalize = heat.state == HEAT_FINALIZING;
 	uint32_t epoch = heat.epoch;
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
 	if (!finalize) {
 		return;
 	}
@@ -733,6 +829,7 @@ void sensor_tcal_heated_finalize(void)
 			/* This RAM publication is completion's linearization point. */
 			heat.applied = applied;
 			if (applied) {
+				trace_apply_pending = true;
 				heat.warm_pending = true;
 				heat.written_mask = 0;
 				sensor_tcal_lock();
@@ -752,6 +849,7 @@ void sensor_tcal_heated_finalize(void)
 		}
 	}
 	sensor_tcal_heated_unlock();
+	heat_trace_flush();
 	if (applied) {
 		/* Mark can flush an overflowing dirty table: no request/model lock held. */
 		sys_warm_transaction_mark(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, sizeof(retained->gyroTemp));
@@ -767,15 +865,13 @@ void sensor_tcal_heated_finalize(void)
 
 void sensor_tcal_heated_report(void)
 {
-	static const char *const states[] = {"idle", "reserved", "running", "finalizing", "finished", "off-failed"};
-	static const char *const reasons[] = {"none", "sensor-stop", "power-down", "user", "timeout", "stale-temperature",
-		"overtemperature", "rise-too-fast", "heater-error", "insufficient-coverage", "complete"};
 	sensor_tcal_heated_lock();
 	enum heat_state state = heat.state;
 	enum tcal_heated_stop_reason reason = heat.reason;
 	bool busy = sensor_tcal_heated_busy_locked();
 	bool applied = heat.applied;
 	bool sampling = heat.sampling;
+	bool trace = trace_enabled;
 	float target = heat.target, setpoint = heat.setpoint;
 	float minimum = heat.accepted_min, maximum = heat.accepted_max;
 	uint16_t duty = heat.duty, count = heat.count;
@@ -784,7 +880,8 @@ void sensor_tcal_heated_report(void)
 	struct heater_hw_status hardware;
 	heater_hw_get_status(&hardware);
 	sensor_tcal_heated_unlock();
-	printk("Heated T-Cal: active=%s state=%s reason=%s sampling=%s\n", busy ? "yes" : "no", states[state], reasons[reason], sampling ? "yes" : "no");
+	printk("Heated T-Cal: active=%s state=%s reason=%s sampling=%s\n", busy ? "yes" : "no", heat_state_names[state],
+	       heat_reason_names[reason], sampling ? "yes" : "no");
 	printk("  target=%.2fC setpoint=%.2fC duty=%u/10000 temperature=%s", (double)target, (double)setpoint, duty, fresh ? "fresh" : "unavailable/stale");
 	if (fresh) {
 		printk(" raw=%.2fC filtered=%.2fC age=%lldms", (double)observation.raw_c, (double)observation.filtered_c, k_uptime_get() - observation.sampled_at_ms);
@@ -796,5 +893,6 @@ void sensor_tcal_heated_report(void)
 	printk(" model-applied=%s (RAM; asynchronous warm persistence)\n", applied ? "yes" : "no");
 	printk("  hardware armed=%s expired=%s fault=%s error=%d; motion pauses ramp/sampling, may maintain heat\n",
 	       hardware.armed ? "yes" : "no", hardware.expired ? "yes" : "no", hardware.faulted ? "yes" : "no", hardware.last_error);
+	printk("  console-trace=%s (tcal heat log <on|off>)\n", trace ? "on" : "off");
 }
 #endif

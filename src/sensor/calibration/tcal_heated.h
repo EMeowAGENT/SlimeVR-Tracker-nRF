@@ -27,6 +27,11 @@ void sensor_tcal_heated_update(bool is_resting);
 bool sensor_tcal_heated_busy(void);
 void sensor_tcal_heated_report(void);
 
+/* Bench trace over the local console only (printk, no radio traffic). Off by
+ * default; a session emits one line per accepted point plus state transitions. */
+void sensor_tcal_heated_set_log(bool enabled);
+bool sensor_tcal_heated_log_enabled(void);
+
 /* Sensor owner only. True suppresses the ordinary auto accumulator. */
 bool sensor_tcal_heated_feed(const float g[3], float temp);
 /* Existing calibration worker; never called with model/storage locks held. */
@@ -40,7 +45,8 @@ void sensor_tcal_heated_clear_end(void);
 void sensor_tcal_heated_lock(void);
 void sensor_tcal_heated_unlock(void);
 bool sensor_tcal_heated_busy_locked(void);
-void sensor_tcal_heated_accept_point(int idx, const float bias[3], float temp);
+/* Returns true only when the slot was empty and the point was stored. */
+bool sensor_tcal_heated_accept_point(int idx, const float bias[3], float temp);
 /* Sensor owner, gate held; accepted slots are immutable within a session. */
 bool sensor_tcal_heated_slot_accepted(int idx);
 bool sensor_tcal_heated_start_window(float temp);
