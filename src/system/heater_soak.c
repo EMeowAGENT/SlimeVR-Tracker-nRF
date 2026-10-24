@@ -21,7 +21,7 @@
 #include "system/power.h"
 #include "system/test_mode.h"
 #include "sensor/sensor.h"
-#include "calibration/tcal_heated.h"
+#include "sensor/calibration/tcal_heated.h"
 
 LOG_MODULE_REGISTER(heater_soak, LOG_LEVEL_INF);
 
