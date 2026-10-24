@@ -3,6 +3,7 @@
 #include "system/battery_tracker.h"
 #include "system/test_mode.h"
 #include "system/wom_timeout.h"
+#include "system/heater_soak.h"
 #include "sensor/sensor.h"
 #include "sensor/calibration/calibration.h"
 #include "sensor/calibration/online_mag.h"
@@ -2674,6 +2675,71 @@ static void console_cmd_led(size_t argc, char **argv)
 }
 #endif
 
+static void console_cmd_soak(size_t argc, char **argv)
+{
+	if (!console_require_args(argc, 2, 5)) {
+		return;
+	}
+	if (strcmp(argv[1], "stop") == 0) {
+		heater_soak_stop();
+		return;
+	}
+	if (strcmp(argv[1], "status") == 0) {
+		heater_soak_report();
+		return;
+	}
+	if (strcmp(argv[1], "start") != 0) {
+		printk("Usage: soak start <minutes 1-120> [target C 20-47] [duty 1-9900]\n");
+		printk("       soak stop | soak status\n");
+		console_reject();
+		return;
+	}
+	if (!console_require_args(argc, 3, 5)) {
+		return;
+	}
+
+	char *end = NULL;
+	errno = 0;
+	unsigned long minutes = strtoul(argv[2], &end, 10);
+	if (end == argv[2] || *end != '\0' || errno == ERANGE || minutes == 0 || minutes > 120) {
+		printk("Error: minutes must be 1-120\n");
+		console_reject();
+		return;
+	}
+
+	float target = 43.0f;
+	if (argc >= 4) {
+		end = NULL;
+		errno = 0;
+		target = strtof(argv[3], &end);
+		if (end == argv[3] || *end != '\0' || errno == ERANGE ||
+		    !isfinite(target) || target < 20.0f || target >= 48.0f) {
+			printk("Error: target must be 20-47.9 C\n");
+			console_reject();
+			return;
+		}
+	}
+
+	unsigned long duty = CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT;
+	if (argc >= 5) {
+		end = NULL;
+		errno = 0;
+		duty = strtoul(argv[4], &end, 10);
+		if (end == argv[4] || *end != '\0' || errno == ERANGE ||
+		    duty == 0 || duty > 9900) {
+			printk("Error: duty must be 1-9900 (1/10000)\n");
+			console_reject();
+			return;
+		}
+	}
+
+	int err = heater_soak_start((uint16_t)minutes, target, (uint16_t)duty);
+	if (err) {
+		printk("Soak start rejected: %d\n", err);
+		console_reject();
+	}
+}
+
 static const struct console_cmd console_cmds[] = {
 	{"help", console_cmd_help, CONSOLE_QUERY},
 	{"info", console_cmd_info, CONSOLE_QUERY},
@@ -2727,6 +2793,7 @@ static const struct console_cmd console_cmds[] = {
 	{"reset", console_cmd_reset, CONSOLE_MUTATION},
 	{"tdma", console_cmd_tdma, CONSOLE_MIXED},
 	{"test", console_cmd_test, CONSOLE_MIXED},
+	{"soak", console_cmd_soak, CONSOLE_MUTATION},
 #if CONFIG_LED_DEBUG
 	{"led", console_cmd_led, CONSOLE_QUERY},
 #endif
