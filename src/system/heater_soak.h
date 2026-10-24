@@ -14,7 +14,10 @@
  * fixed ceiling below the hardware shutdown threshold.
  */
 
-int heater_soak_start(uint16_t minutes, float target_c, uint16_t duty_pptt);
+/* Closed loop: hold target_c, drive capped by CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT. */
+int heater_soak_start(uint16_t minutes, float target_c);
+/* Open loop: fixed duty_pptt, no temperature target (ceiling still enforced). */
+int heater_soak_start_raw(uint16_t minutes, uint16_t duty_pptt);
 void heater_soak_stop(void);
 bool heater_soak_active(void);
 void heater_soak_report(void);

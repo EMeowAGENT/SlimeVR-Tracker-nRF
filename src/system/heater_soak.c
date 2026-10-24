@@ -34,6 +34,7 @@ LOG_MODULE_REGISTER(heater_soak, LOG_LEVEL_INF);
 
 static struct {
 	bool active;
+	bool closed_loop;
 	uint32_t generation;
 	uint32_t sequence;
 	uint16_t max_duty;
@@ -98,7 +99,9 @@ static void soak_tick(struct k_work *work)
 		return;
 	}
 
-	if (observation.raw_c < soak.target - SOAK_HYSTERESIS_C) {
+	if (!soak.closed_loop) {
+		soak.duty = soak.max_duty;
+	} else if (observation.raw_c < soak.target - SOAK_HYSTERESIS_C) {
 		soak.duty = soak.max_duty;
 	} else if (observation.raw_c > soak.target + SOAK_HYSTERESIS_C) {
 		soak.duty = 0;
@@ -124,12 +127,13 @@ static void soak_tick(struct k_work *work)
 	k_mutex_unlock(&soak_lock);
 }
 
-int heater_soak_start(uint16_t minutes, float target_c, uint16_t duty_pptt)
+static int soak_begin(uint16_t minutes, float target_c, uint16_t duty_pptt, bool closed_loop)
 {
 	if (minutes == 0 || minutes > 120) {
 		return -EINVAL;
 	}
-	if (!isfinite(target_c) || target_c < 20.0f || target_c >= SOAK_CEILING_C) {
+	if (closed_loop &&
+	    (!isfinite(target_c) || target_c < 20.0f || target_c >= SOAK_CEILING_C)) {
 		return -EINVAL;
 	}
 	if (duty_pptt == 0 || duty_pptt > 9900) {
@@ -164,6 +168,7 @@ int heater_soak_start(uint16_t minutes, float target_c, uint16_t duty_pptt)
 
 	int64_t now = k_uptime_get();
 	soak.active = true;
+	soak.closed_loop = closed_loop;
 	soak.sequence = 0;
 	soak.max_duty = duty_pptt;
 	soak.duty = duty_pptt;
@@ -177,11 +182,26 @@ int heater_soak_start(uint16_t minutes, float target_c, uint16_t duty_pptt)
 	k_work_reschedule(&soak_work, K_MSEC(200));
 	k_mutex_unlock(&soak_lock);
 
-	printk("Soak started: %u min, target %.1f C, duty cap %u/10000.\n",
-	       minutes, (double)target_c, duty_pptt);
+	if (closed_loop) {
+		printk("Soak started: %u min, closed loop at %.1f C, duty cap %u/10000.\n",
+		       minutes, (double)target_c, duty_pptt);
+	} else {
+		printk("Soak started: %u min, open loop at fixed duty %u/10000.\n",
+		       minutes, duty_pptt);
+	}
 	printk("Ceiling %.0f C, abort on external power loss. 'soak stop' ends it early.\n",
 	       (double)SOAK_CEILING_C);
 	return 0;
+}
+
+int heater_soak_start(uint16_t minutes, float target_c)
+{
+	return soak_begin(minutes, target_c, CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT, true);
+}
+
+int heater_soak_start_raw(uint16_t minutes, uint16_t duty_pptt)
+{
+	return soak_begin(minutes, 0.0f, duty_pptt, false);
 }
 
 void heater_soak_stop(void)
@@ -207,6 +227,7 @@ void heater_soak_report(void)
 {
 	k_mutex_lock(&soak_lock, K_FOREVER);
 	bool active = soak.active;
+	bool closed_loop = soak.closed_loop;
 	float target = soak.target;
 	uint16_t duty = soak.duty;
 	uint16_t max_duty = soak.max_duty;
@@ -216,9 +237,15 @@ void heater_soak_report(void)
 	struct sensor_temperature_observation observation;
 	bool fresh = sensor_get_imu_temperature_observation(&observation, 2000) == 0;
 
-	printk("Soak: %s target=%.1fC duty=%u/%u remaining=%llds temperature=",
-	       active ? "active" : "inactive", (double)target, duty, max_duty,
-	       (long long)(remaining / 1000));
+	if (closed_loop) {
+		printk("Soak: %s closed loop target=%.1fC duty=%u/%u remaining=%llds temperature=",
+		       active ? "active" : "inactive", (double)target, duty, max_duty,
+		       (long long)(remaining / 1000));
+	} else {
+		printk("Soak: %s open loop duty=%u/%u remaining=%llds temperature=",
+		       active ? "active" : "inactive", duty, max_duty,
+		       (long long)(remaining / 1000));
+	}
 	if (fresh) {
 		printk("raw=%.2fC filtered=%.2fC\n", (double)observation.raw_c,
 		       (double)observation.filtered_c);
@@ -229,10 +256,16 @@ void heater_soak_report(void)
 
 #else /* !CONFIG_SENSOR_TCAL_HEATED */
 
-int heater_soak_start(uint16_t minutes, float target_c, uint16_t duty_pptt)
+int heater_soak_start(uint16_t minutes, float target_c)
 {
 	ARG_UNUSED(minutes);
 	ARG_UNUSED(target_c);
+	return -ENOTSUP;
+}
+
+int heater_soak_start_raw(uint16_t minutes, uint16_t duty_pptt)
+{
+	ARG_UNUSED(minutes);
 	ARG_UNUSED(duty_pptt);
 	return -ENOTSUP;
 }

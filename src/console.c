@@ -2677,7 +2677,7 @@ static void console_cmd_led(size_t argc, char **argv)
 
 static void console_cmd_soak(size_t argc, char **argv)
 {
-	if (!console_require_args(argc, 2, 5)) {
+	if (!console_require_args(argc, 2, 4)) {
 		return;
 	}
 	if (strcmp(argv[1], "stop") == 0) {
@@ -2688,13 +2688,17 @@ static void console_cmd_soak(size_t argc, char **argv)
 		heater_soak_report();
 		return;
 	}
-	if (strcmp(argv[1], "start") != 0) {
-		printk("Usage: soak start <minutes 1-120> [target C 20-47] [duty 1-9900]\n");
+
+	bool raw = strcmp(argv[1], "raw") == 0;
+	bool start = strcmp(argv[1], "start") == 0;
+	if (!raw && !start) {
+		printk("Usage: soak start <minutes 1-120> [target C 20-47.9]   (closed loop)\n");
+		printk("       soak raw   <minutes 1-120> [duty 1-9900]         (open loop)\n");
 		printk("       soak stop | soak status\n");
 		console_reject();
 		return;
 	}
-	if (!console_require_args(argc, 3, 5)) {
+	if (!console_require_args(argc, 3, 4)) {
 		return;
 	}
 
@@ -2707,38 +2711,43 @@ static void console_cmd_soak(size_t argc, char **argv)
 		return;
 	}
 
-	float target = 43.0f;
-	if (argc >= 4) {
-		end = NULL;
-		errno = 0;
-		target = strtof(argv[3], &end);
-		if (end == argv[3] || *end != '\0' || errno == ERANGE ||
-		    !isfinite(target) || target < 20.0f || target >= 48.0f) {
-			printk("Error: target must be 20-47.9 C\n");
-			console_reject();
-			return;
+	int err;
+	if (start) {
+		float target = 43.0f;
+		if (argc == 4) {
+			end = NULL;
+			errno = 0;
+			target = strtof(argv[3], &end);
+			if (end == argv[3] || *end != '\0' || errno == ERANGE ||
+			    !isfinite(target) || target < 20.0f || target >= 48.0f) {
+				printk("Error: target must be 20-47.9 C\n");
+				console_reject();
+				return;
+			}
 		}
+		err = heater_soak_start((uint16_t)minutes, target);
+	} else {
+		unsigned long duty = CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT;
+		if (argc == 4) {
+			end = NULL;
+			errno = 0;
+			duty = strtoul(argv[3], &end, 10);
+			if (end == argv[3] || *end != '\0' || errno == ERANGE ||
+			    duty == 0 || duty > 9900) {
+				printk("Error: duty must be 1-9900 (1/10000)\n");
+				console_reject();
+				return;
+			}
+		}
+		err = heater_soak_start_raw((uint16_t)minutes, (uint16_t)duty);
 	}
 
-	unsigned long duty = CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT;
-	if (argc >= 5) {
-		end = NULL;
-		errno = 0;
-		duty = strtoul(argv[4], &end, 10);
-		if (end == argv[4] || *end != '\0' || errno == ERANGE ||
-		    duty == 0 || duty > 9900) {
-			printk("Error: duty must be 1-9900 (1/10000)\n");
-			console_reject();
-			return;
-		}
-	}
-
-	int err = heater_soak_start((uint16_t)minutes, target, (uint16_t)duty);
 	if (err) {
 		printk("Soak start rejected: %d\n", err);
 		console_reject();
 	}
 }
+
 
 static const struct console_cmd console_cmds[] = {
 	{"help", console_cmd_help, CONSOLE_QUERY},
